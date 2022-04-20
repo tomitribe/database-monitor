@@ -1,0 +1,5 @@
+= database-monitor
+
+Small set of client code around Apache ActiveMQ "Classic".
+Goal is to try the failover mechanism using a SQL database.
+This repo also has a couple of ActiveMQ clients to produce and consume data easily.
