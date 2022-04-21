@@ -21,12 +21,10 @@ import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.message.BasicHeader;
 import org.jolokia.client.BasicAuthenticator;
 import org.jolokia.client.J4pClient;
-import org.jolokia.client.exception.J4pException;
 import org.jolokia.client.exception.J4pRemoteException;
 import org.jolokia.client.request.J4pListRequest;
 import org.jolokia.client.request.J4pReadRequest;
 import org.jolokia.client.request.J4pResponse;
-import org.jolokia.client.request.J4pTargetConfig;
 import org.json.simple.JSONObject;
 import org.tomitribe.crest.api.Command;
 import org.tomitribe.crest.api.Default;
@@ -35,17 +33,16 @@ import org.tomitribe.crest.api.StreamingOutput;
 import org.tomitribe.util.Duration;
 import org.tomitribe.util.TimeUtils;
 
-import javax.management.MalformedObjectNameException;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.PrintWriter;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Instant;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Executors;
@@ -78,69 +75,79 @@ public class Monitor {
         Class.forName("org.mariadb.jdbc.Driver");
         final String query = "select BROKER_NAME,TIME from ACTIVEMQ_LOCK";
 
-        Lock last = null;
-        Lock current = null;
+        return os -> {
+            final PrintWriter pw = new PrintWriter(os);
 
-        try (final Connection connection = DriverManager.getConnection(url, user, password);
-             final PreparedStatement ps = connection.prepareStatement(query)) {
+            Lock last = null;
+            Lock current = null;
 
-            while (true) {
+            try (final Connection connection = DriverManager.getConnection(url, user, password);
+                 final PreparedStatement ps = connection.prepareStatement(query)) {
 
-                try (final ResultSet resultSet = ps.executeQuery()) {
+                while (true) {
 
-                    if (!resultSet.next()) {
-                        throw new IllegalStateException("Could not read ACTIVEMQ_LOCKS. No result found.");
-                    }
+                    try (final ResultSet resultSet = ps.executeQuery()) {
 
-                    final String brokerName = resultSet.getString(1);
-                    final long brokerTime = resultSet.getLong(2);
-
-                    current = new Lock(brokerName, Instant.ofEpochMilli(brokerTime));
-
-                    // if (last == null || !last.equals(current)) {
-                    if (last == null
-                        || last.brokerName() == null
-                        || !last.brokerName().equals(current.brokerName())) {
-
-                        // the broker has changed.... do something
-                        System.out.printf("[%s] Broker changed from %s to %s%n", Instant.now(), last, current);
-
-                        // We'll now take the jstack of the process to see what's happening
-                        // and more precisely, see if some pending threads are holding the process and the lock
-                        // don't do the first time though
-                        if (last != null) {
-
-                            final long time = jstackDuration.getTime(TimeUnit.NANOSECONDS);
-                            final long start = System.nanoTime();
-
-                            while (System.nanoTime() - start < time) {
-
-                                final long remainingNanos = time - System.nanoTime() + start;
-                                System.out.printf("-----%n" +
-                                                  "Collecting information from ActiveMQ process id %s " +
-                                                  "for %s to look for threads holding the shutdown%n" +
-                                                  "-----%n",
-                                                  pid, TimeUtils.abbreviate(remainingNanos, TimeUnit.NANOSECONDS));
-
-                                jstackIt(pid, jstackDuration, System.out::println);
-
-                                // and now see if we can dump some data from JMX
-                                dumpJmx();
-                            }
+                        if (!resultSet.next()) {
+                            throw new IllegalStateException("Could not read ACTIVEMQ_LOCKS. No result found.");
                         }
 
+                        final String brokerName = resultSet.getString(1);
+                        final long brokerTime = resultSet.getLong(2);
 
-                        last = current;
+                        current = new Lock(brokerName, Instant.ofEpochMilli(brokerTime));
+
+                        // if (last == null || !last.equals(current)) {
+                        if (last == null
+                            || last.brokerName() == null
+                            || !last.brokerName().equals(current.brokerName())) {
+
+                            // the broker has changed.... do something
+                            log(pw, "[%s] Broker changed from %s to %s%n", Instant.now(), last, current);
+
+                            // We'll now take the jstack of the process to see what's happening
+                            // and more precisely, see if some pending threads are holding the process and the lock
+                            // don't do the first time though
+                            if (last != null) {
+
+                                final long time = jstackDuration.getTime(TimeUnit.NANOSECONDS);
+                                final long start = System.nanoTime();
+
+                                while (System.nanoTime() - start < time) {
+
+                                    final long remainingNanos = time - System.nanoTime() + start;
+                                    log(pw, "-----%n" +
+                                                      "Collecting information from ActiveMQ process id %s " +
+                                                      "for %s to look for threads holding the shutdown%n" +
+                                                      "-----%n",
+                                                      pid, TimeUtils.abbreviate(remainingNanos, TimeUnit.NANOSECONDS));
+
+                                    jstackIt(pid, s -> log(pw, s));
+
+                                    // and now see if we can dump some data from JMX
+                                    dumpJmx(pw);
+                                }
+                            }
+
+
+                            last = current;
+                        }
+
                     }
 
+                    // don't hammer the database for the moment ....
+                    Thread.sleep(100);
+
                 }
-
-                // don't hammer the database for the moment ....
-                Thread.sleep(100);
-
+            } catch (final Exception e) {
+                log(pw, "Unrecoverable error %s", e.getMessage());
             }
-        }
+        };
 
+    }
+
+    private void log(final PrintWriter pw, final String message, final Object...args) {
+        pw.println(String.format(message, args));
     }
 
     /**
@@ -149,7 +156,7 @@ public class Monitor {
      * @param pid PID of the java process to JStack
      * @throws Exception If something goes wrong
      */
-    private void jstackIt(final String pid, final Duration duration, final Consumer<String> out) throws Exception {
+    private void jstackIt(final String pid, final Consumer<String> out) throws Exception {
         final boolean isWindows = System.getProperty("os.name").toLowerCase().startsWith("windows");
 
         final ProcessBuilder builder = new ProcessBuilder();
@@ -173,7 +180,7 @@ public class Monitor {
         Thread.sleep(1000);
     }
 
-    private void dumpJmx() throws Exception {
+    private void dumpJmx(final PrintWriter pw) throws Exception {
         // final J4pClient client = J4pClient.url("http://ec2-44-201-59-75.compute-1.amazonaws.com:8161/api/jolokia")
         // final J4pClient client = J4pClient.url("http://ec2-3-235-231-230.compute-1.amazonaws.com:8161/api/jolokia")
         final J4pClient client = J4pClient.url("http://127.0.0.1:8161/api/jolokia/")
@@ -191,16 +198,16 @@ public class Monitor {
                                  .connectionTimeout(3000)
                                  .build();
 
-        list(client, "");
+        list(pw, client, "");
     }
 
-    private void list(final J4pClient client, final String path) throws Exception {
+    private void list(final PrintWriter pw, final J4pClient client, final String path) throws Exception {
         final J4pResponse<J4pListRequest> list;
         try {
             list = client.execute(new J4pListRequest(path));
         } catch (final J4pRemoteException e) {
             if (!"java.lang.UnsupportedOperationException".equals(e.getErrorType())) {
-                System.out.println("Failed to list MBeans for " + path + ". " + e.getMessage());
+                log(pw, "Failed to list MBeans for " + path + ". " + e.getMessage());
             }
             return;
         }
@@ -213,24 +220,24 @@ public class Monitor {
                     pObjectName.startsWith("java.lang")
                     || pObjectName.startsWith("org.apache")
                 )) {
-                    System.out.println("Skipping MBean " + pObjectName);
+                    log(pw, "Skipping MBean " + pObjectName);
                     continue;
                 }
 
                 try {
                     final J4pResponse<J4pReadRequest> read = client.execute(new J4pReadRequest(pObjectName));
-                    System.out.println(pObjectName + " > " + ((JSONObject) read.getValue()).toJSONString());
+                    log(pw, pObjectName + " > " + ((JSONObject) read.getValue()).toJSONString());
                 } catch (final J4pRemoteException e) {
                     if (!"java.lang.UnsupportedOperationException".equals(e.getErrorType())) {
-                        System.out.println("Failed to read MBeans for " + pObjectName + ". " + e.getMessage());
+                        log(pw, "Failed to read MBeans for " + pObjectName + ". " + e.getMessage());
                     }
                 }
             } else {
                 try {
-                    list(client, "" + stringKey);
+                    list(pw, client, "" + stringKey);
                 } catch (final J4pRemoteException e) {
                     if (!"java.lang.UnsupportedOperationException".equals(e.getErrorType())) {
-                        System.out.println("Failed to list MBeans for " + stringKey + ". " + e.getMessage());
+                        log(pw, "Failed to list MBeans for " + stringKey + ". " + e.getMessage());
                     }
                 }
             }
